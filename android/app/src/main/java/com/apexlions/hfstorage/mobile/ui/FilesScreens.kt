@@ -1,6 +1,6 @@
 @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 
-package com.apexlions16.hfstorage.mobile.ui
+package com.apexlions.hfstorage.mobile.ui
 
 import android.app.DownloadManager
 import android.content.Context
