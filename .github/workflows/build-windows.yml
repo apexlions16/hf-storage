@@ -64,11 +64,12 @@ jobs:
             dist/HFStorage-Windows-x64.zip
 
       - name: Publish HF Storage v0.1.0 release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release):')
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release):')) || (github.event_name == 'pull_request' && github.head_ref == 'release/v0.1.0')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: v0.1.0
+          RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
         run: |
           @'
           ## HF Storage v0.1.0
@@ -92,5 +93,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --target $env:GITHUB_SHA --title "HF Storage v0.1.0" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+            gh release create $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --target $env:RELEASE_TARGET --title "HF Storage v0.1.0" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
           }
