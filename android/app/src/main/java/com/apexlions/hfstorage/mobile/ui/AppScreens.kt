@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -381,8 +380,8 @@ private fun RepositoriesScreen(
     if (showCreate) {
         CreateRepositoryDialog(
             onDismiss = { showCreate = false },
-            onCreate = { name, type, private ->
-                viewModel.createRepository(name, type, private) { showCreate = false }
+            onCreate = { name, type, isPrivate ->
+                viewModel.createRepository(name, type, isPrivate) { showCreate = false }
             },
         )
     }
