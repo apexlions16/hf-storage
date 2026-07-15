@@ -1,17 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_all
+
 root = Path(SPECPATH)
 icon = root / "assets" / "hf-storage.ico"
+
+hf_xet_datas, hf_xet_binaries, hf_xet_hiddenimports = collect_all("hf_xet")
 
 a = Analysis(
     [str(root / "run.py")],
     pathex=[str(root / "src")],
-    binaries=[],
-    datas=[],
+    binaries=hf_xet_binaries,
+    datas=hf_xet_datas,
     hiddenimports=[
         "huggingface_hub",
         "hf_xet",
+        *hf_xet_hiddenimports,
         "PySide6.QtSvg",
         "PySide6.QtNetwork",
     ],
