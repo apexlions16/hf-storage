@@ -55,10 +55,42 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach to GitHub Release
+      - name: Attach assets to manually published release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/HFStorage.exe
             dist/HFStorage-Windows-x64.zip
+
+      - name: Publish HF Storage v0.1.0 release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release):')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v0.1.0
+        run: |
+          @'
+          ## HF Storage v0.1.0
+
+          İlk Windows sürümü.
+
+          ### Öne çıkanlar
+          - Hugging Face read + write token ile güvenli giriş
+          - Model, Dataset, Space ve Bucket depolarını tek panelden yönetme
+          - Canlı depolama kullanımı ve kalan alan göstergesi
+          - 100 dosyaya kadar tek commit kullanan batch upload
+          - Dosya/klasör yükleme, indirme, taşıma ve yeniden adlandırma
+          - LFS/Xet nesneleri için onaylı kalıcı silme
+          - Windows DPAPI ile isteğe bağlı şifreli token saklama
+          - Profesyonel koyu temalı Windows arayüzü
+
+          Windows 10/11 x64 için `HFStorage.exe` dosyasını veya portable ZIP paketini indirebilirsiniz.
+          '@ | Set-Content -Path release-notes.md -Encoding utf8
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --target $env:GITHUB_SHA --title "HF Storage v0.1.0" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+          }
