@@ -1,0 +1,115 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android-apk.yml"
+      - "PLATFORMS.md"
+  pull_request:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-apk.yml"
+      - "PLATFORMS.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Run Android unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p android :app:testDebugUnitTest --stacktrace 2>&1 | tee android-build.log
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-diagnostics
+          path: android-build.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build installable APK
+        run: gradle -p android :app:assembleDebug --stacktrace
+
+      - name: Prepare release asset
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.0.apk
+          sha256sum dist/HFStorage-Android-v0.1.0.apk > dist/HFStorage-Android-v0.1.0.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HFStorage-Android-v0.1.0
+          path: |
+            dist/HFStorage-Android-v0.1.0.apk
+            dist/HFStorage-Android-v0.1.0.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Android v0.1.0 release
+        if: (github.event_name == 'pull_request' && github.head_ref == 'feature/android-app-v0.1.0') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: android-v0.1.0
+          RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cat > android-release-notes.md <<'NOTES'
+          ## HF Storage Android v0.1.0
+
+          İlk yerel Android sürümü.
+
+          ### Özellikler
+          - Material 3 ile telefonlara özel modern koyu arayüz
+          - Android Keystore AES-GCM ile şifreli token saklama
+          - Model, Dataset ve Space depolarını listeleme
+          - Depo dosyalarını görüntüleme ve indirme
+          - Dosya ve klasör seçerek arka planda yükleme
+          - 100 dosyaya kadar tek Hugging Face commit'i kullanan batch upload
+          - HTTP LFS basic ve multipart büyük dosya aktarımı
+          - Commit ile silme ve isteğe bağlı geri alınamaz LFS/Xet geçmiş temizliği
+          - WorkManager bildirimleriyle aktarım ilerlemesi
+          - Telemetrisiz, aracı sunucusuz doğrudan huggingface.co bağlantısı
+
+          APK GitHub Actions tarafından test edilip derlenmiştir. Bu ilk sürüm debug anahtarıyla imzalanmış, doğrudan kurulabilir bir beta APK'dır.
+          NOTES
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.0.apk dist/HFStorage-Android-v0.1.0.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.0.apk dist/HFStorage-Android-v0.1.0.apk.sha256 \
+              --target "$RELEASE_TARGET" \
+              --title "HF Storage Android v0.1.0" \
+              --notes-file android-release-notes.md \
+              --repo "$GITHUB_REPOSITORY"
+          fi
