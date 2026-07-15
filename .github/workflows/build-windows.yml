@@ -63,28 +63,27 @@ jobs:
             dist/HFStorage.exe
             dist/HFStorage-Windows-x64.zip
 
-      - name: Publish HF Storage v0.1.0 release
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release):')) || (github.event_name == 'pull_request' && github.head_ref == 'release/v0.1.0')
+      - name: Publish HF Storage v0.1.1 release
+        if: github.event_name == 'pull_request' && github.head_ref == 'fix/upload-v0.1.1'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v0.1.0
-          RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          RELEASE_TAG: v0.1.1
+          RELEASE_TARGET: ${{ github.event.pull_request.head.sha }}
         run: |
           @'
-          ## HF Storage v0.1.0
+          ## HF Storage v0.1.1
 
-          İlk Windows sürümü.
+          Dosya yükleme düzeltme sürümü.
 
-          ### Öne çıkanlar
-          - Hugging Face read + write token ile güvenli giriş
-          - Model, Dataset, Space ve Bucket depolarını tek panelden yönetme
-          - Canlı depolama kullanımı ve kalan alan göstergesi
-          - 100 dosyaya kadar tek commit kullanan batch upload
-          - Dosya/klasör yükleme, indirme, taşıma ve yeniden adlandırma
-          - LFS/Xet nesneleri için onaylı kalıcı silme
-          - Windows DPAPI ile isteğe bağlı şifreli token saklama
-          - Profesyonel koyu temalı Windows arayüzü
+          ### Düzeltilenler
+          - Normal dosya, LFS ve Xet aktarımı doğrudan `create_commit` üzerinden yapılıyor
+          - 100 dosya hâlâ tek batch commit olarak gönderiliyor
+          - Windows EXE paketine `hf_xet` yerel çalışma dosyaları eksiksiz ekleniyor
+          - Yükleme öncesinde depo yazma izni doğrulanıyor
+          - 401, 403, 404, 413, 429, sunucu, SSL ve Xet hataları anlaşılır biçimde gösteriliyor
+          - Ayrıntılı hata günlüğü `%LOCALAPPDATA%\HFStorage\logs\upload-errors.log` konumuna yazılıyor
+          - Hugging Face telemetrisi kapatılıyor ve Xet ayarları importtan önce uygulanıyor
 
           Windows 10/11 x64 için `HFStorage.exe` dosyasını veya portable ZIP paketini indirebilirsiniz.
           '@ | Set-Content -Path release-notes.md -Encoding utf8
@@ -93,5 +92,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --target $env:RELEASE_TARGET --title "HF Storage v0.1.0" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+            gh release create $env:RELEASE_TAG dist/HFStorage.exe dist/HFStorage-Windows-x64.zip --target $env:RELEASE_TARGET --title "HF Storage v0.1.1" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
           }
