@@ -31,7 +31,7 @@ internal fun CreateRepositoryDialog(
 ) {
     var name by remember { mutableStateOf("") }
     var type by remember { mutableStateOf(RepoType.DATASET) }
-    var private by remember { mutableStateOf(true) }
+    var isPrivate by remember { mutableStateOf(true) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -53,14 +53,14 @@ internal fun CreateRepositoryDialog(
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = private, onCheckedChange = { private = it })
+                    Switch(checked = isPrivate, onCheckedChange = { isPrivate = it })
                     Spacer(Modifier.width(8.dp))
-                    Text(if (private) "Özel depo" else "Public depo")
+                    Text(if (isPrivate) "Özel depo" else "Public depo")
                 }
             }
         },
         confirmButton = {
-            Button(onClick = { onCreate(name, type, private) }, enabled = name.isNotBlank()) {
+            Button(onClick = { onCreate(name, type, isPrivate) }, enabled = name.isNotBlank()) {
                 Text("Oluştur")
             }
         },
