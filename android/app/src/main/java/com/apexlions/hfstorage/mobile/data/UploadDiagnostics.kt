@@ -1,10 +1,20 @@
 package com.apexlions.hfstorage.mobile.data
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import java.io.File
 import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
+
+data class DiagnosticWriteResult(
+    val privateFile: File,
+    val exportedLocation: String?,
+)
 
 object UploadDiagnostics {
     private const val DIRECTORY = "logs"
@@ -18,7 +28,12 @@ object UploadDiagnostics {
 
     fun exists(context: Context): Boolean = logFile(context).let { it.isFile && it.length() > 0L }
 
-    fun write(context: Context, job: UploadJob?, token: String?, error: Throwable): File? = runCatching {
+    fun write(
+        context: Context,
+        job: UploadJob?,
+        token: String?,
+        error: Throwable,
+    ): DiagnosticWriteResult? = runCatching {
         val output = logFile(context)
         if (output.exists() && output.length() > MAX_LOG_BYTES) {
             output.writeText("HF Storage Android tanı günlüğü döndürüldü.\n", Charsets.UTF_8)
@@ -40,7 +55,10 @@ object UploadDiagnostics {
             },
             Charsets.UTF_8,
         )
-        output
+        DiagnosticWriteResult(
+            privateFile = output,
+            exportedLocation = exportReadableCopy(context, output),
+        )
     }.getOrNull()
 
     /**
@@ -69,4 +87,41 @@ object UploadDiagnostics {
         )
         true
     }.getOrDefault(false)
+
+    private fun exportReadableCopy(context: Context, source: File): String? = runCatching {
+        val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(OffsetDateTime.now())
+        val displayName = "HFStorage-upload-error-$stamp.log"
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/HFStorage")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("Downloads kaydı oluşturulamadı.")
+            try {
+                resolver.openOutputStream(uri, "w")?.use { output ->
+                    source.inputStream().use { input -> input.copyTo(output) }
+                } ?: error("Downloads dosyası açılamadı.")
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            } catch (error: Throwable) {
+                resolver.delete(uri, null, null)
+                throw error
+            }
+            "İndirilenler/HFStorage/$displayName"
+        } else {
+            val directory = File(
+                context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS),
+                "HFStorage",
+            ).apply { mkdirs() }
+            val target = File(directory, displayName)
+            source.copyTo(target, overwrite = true)
+            target.absolutePath
+        }
+    }.getOrNull()
 }
