@@ -1,7 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr::null_mut;
-use std::str::FromStr;
 use std::sync::Once;
 
 use jni::JNIEnv;
@@ -34,7 +33,6 @@ fn initialize_xet(cache_dir: &str) {
             std::env::set_var("HF_XET_LOG_FILE", format!("{cache_dir}/xet-upload.log"));
             std::env::set_var("TMPDIR", format!("{cache_dir}/tmp"));
         }
-        xet::init_logging("hf-storage-android/0.1.1".to_string());
     });
 }
 
