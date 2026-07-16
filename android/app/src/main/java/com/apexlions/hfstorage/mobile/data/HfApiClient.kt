@@ -49,7 +49,7 @@ class HfApiClient(
     private fun requestBuilder(url: String): Request.Builder = Request.Builder()
         .url(url)
         .header("Authorization", "Bearer $token")
-        .header("User-Agent", "hf-storage-android/0.1.0")
+        .header("User-Agent", "hf-storage-android/0.1.4")
         .header("Accept", "application/json")
 
     suspend fun authenticate(): Account = withContext(Dispatchers.IO) {
@@ -211,7 +211,8 @@ class HfApiClient(
     }
 
     internal fun executeRaw(request: Request): okhttp3.Response {
-        val response = client.newCall(request).execute()
+        val canonicalRequest = request.withCanonicalCommitBody()
+        val response = client.newCall(canonicalRequest).execute()
         if (!response.isSuccessful) {
             val detail = response.body?.string().orEmpty().take(1200)
             response.close()
