@@ -20,13 +20,31 @@ object XetNative {
         System.loadLibrary("hfstorage_xet")
     }
 
+    @Volatile
+    private var verifierInitialization: Result<Unit>? = null
+
+    /**
+     * Initializes rustls-platform-verifier with the Android application Context.
+     * This must happen before the first Xet HTTPS request. The result is cached
+     * for the complete process lifetime because the Rust verifier is one-time.
+     */
+    @Synchronized
+    fun initialize(context: Context): Result<Unit> {
+        verifierInitialization?.let { return it }
+        val result = runCatching {
+            loadResult.getOrThrow()
+            nativeInitialize(context.applicationContext)
+        }
+        verifierInitialization = result
+        return result
+    }
+
     val isAvailable: Boolean
-        get() = loadResult.isSuccess
+        get() = loadResult.isSuccess && verifierInitialization?.isSuccess == true
 
     val loadError: String?
-        get() = loadResult.exceptionOrNull()?.let { error ->
-            error.message ?: error::class.java.simpleName
-        }
+        get() = loadResult.exceptionOrNull()?.let { it.message ?: it::class.java.simpleName }
+            ?: verifierInitialization?.exceptionOrNull()?.let { it.message ?: it::class.java.simpleName }
 
     fun uploadFiles(
         context: Context,
@@ -34,9 +52,9 @@ object XetNative {
         hubToken: String,
         filePaths: List<String>,
     ): List<XetNativeUploadResult> {
-        loadResult.getOrElse { error ->
+        initialize(context).getOrElse { error ->
             throw HfApiException(
-                "Xet zorunlu fakat telefonun işlemcisi için native Xet bileşeni yüklenemedi: " +
+                "Xet TLS doğrulayıcısı başlatılamadı: " +
                     (error.message ?: error::class.java.simpleName),
             )
         }
@@ -53,6 +71,9 @@ object XetNative {
         )
         return json.decodeFromString(response)
     }
+
+    @JvmStatic
+    private external fun nativeInitialize(context: Context)
 
     @JvmStatic
     private external fun nativeUploadFiles(

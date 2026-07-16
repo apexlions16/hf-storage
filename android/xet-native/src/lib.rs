@@ -82,7 +82,7 @@ fn upload_with_xet(
     );
     refresh_headers.insert(
         header::USER_AGENT,
-        HeaderValue::from_static("hf-storage-android/0.1.1"),
+        HeaderValue::from_static("hf-storage-android/0.1.2"),
     );
 
     // Hub Authorization must only be sent to the token refresh route. CAS calls
@@ -90,7 +90,7 @@ fn upload_with_xet(
     let mut cas_headers = HeaderMap::new();
     cas_headers.insert(
         header::USER_AGENT,
-        HeaderValue::from_static("hf-storage-android-xet/0.1.1"),
+        HeaderValue::from_static("hf-storage-android-xet/0.1.2"),
     );
 
     let session = XetSessionBuilder::new()
@@ -152,6 +152,26 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     } else {
         "Bilinmeyen Rust/Xet paniği".to_string()
     }
+}
+
+/// rustls-platform-verifier must receive the Android application Context before
+/// Xet creates any HTTPS client. The verifier stores the JVM, Context and class
+/// loader globally and then safely uses Android's system TrustManager from Xet's
+/// background Rust threads.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apexlions_hfstorage_mobile_data_XetNative_nativeInitialize<'caller>(
+    mut unowned_env: jni22::EnvUnowned<'caller>,
+    _class: jni22::objects::JClass<'caller>,
+    context: jni22::objects::JObject<'caller>,
+) {
+    use jni22::errors::ThrowRuntimeExAndDefault;
+
+    unowned_env
+        .with_env(|env| -> jni22::errors::Result<()> {
+            rustls_platform_verifier::android::init_with_env(env, context)?;
+            Ok(())
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]

@@ -49,8 +49,7 @@ class UploadWorker(
             job = queue.load(id)
 
             // Android 14+ requires the foreground service type both in the
-            // manifest and in ForegroundInfo. Omitting it caused the process to
-            // be terminated as soon as an upload started on Android 14-16.
+            // manifest and in ForegroundInfo.
             setForeground(createForeground(id, "Xet yüklemesi hazırlanıyor", 0, job.items.size))
 
             UploadEngine(applicationContext, HfApiClient(token), token).upload(job) { progress ->
@@ -75,12 +74,18 @@ class UploadWorker(
             throw cancelled
         } catch (error: Throwable) {
             Log.e(TAG, "Upload failed for job=$id", error)
-            val log = UploadDiagnostics.write(applicationContext, job, token, error)
+            val diagnostic = UploadDiagnostics.write(applicationContext, job, token, error)
             val message = buildString {
                 append(error.message ?: error::class.java.simpleName)
-                if (log != null) append("\nTanı günlüğü: ${log.absolutePath}")
+                diagnostic?.exportedLocation?.let { location ->
+                    append("\nTanı günlüğü: $location")
+                } ?: run {
+                    if (diagnostic != null) {
+                        append("\nTanı günlüğünü uygulama içinden paylaşabilirsiniz.")
+                    }
+                }
             }
-            Result.failure(errorData(message, log?.absolutePath))
+            Result.failure(errorData(message, diagnostic?.privateFile?.absolutePath))
         }
     }
 
