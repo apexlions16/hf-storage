@@ -12,12 +12,15 @@ Kaynak kodu şimdilik depo kökündeki Python/PySide6 projesindedir.
 
 ## Android
 
-Android sürümü tamamen ayrı bir Gradle projesidir.
+Android sürümü tamamen ayrı bir Gradle + Rust projesidir.
 
-- Proje: `android/`
+- Kotlin/Compose proje kökü: `android/`
+- Native Xet köprüsü: `android/xet-native/`
 - Application ID: `com.apexlions.hfstorage.mobile`
 - Action: `.github/workflows/android-apk.yml`
 - Release serisi: `android-v0.1.x`
-- Çıktı: `HFStorage-Android-v0.1.0.apk`
+- Güncel çıktı: `HFStorage-Android-v0.1.1.apk`
+- Desteklenen native mimariler: `arm64-v8a`, `x86_64`
+- Yükleme backend'i: zorunlu Hugging Face Xet; Git LFS upload fallback'i yok
 
-İki uygulama aynı Hugging Face hesabını ve depolarını yönetir; ancak arayüz, güvenli token kasası, dosya seçimi, arka plan aktarımı ve paketleme kodları platforma özeldir. Böylece Windows değişiklikleri APK'yı, Android değişiklikleri de EXE'yi gereksiz yere etkilemez.
+İki uygulama aynı Hugging Face hesabını ve depolarını yönetir; ancak arayüz, güvenli token kasası, dosya seçimi, arka plan aktarımı ve paketleme kodları platforma özeldir. Windows ve Android release etiketleri ayrıdır. Android kaynak değişiklikleri Windows EXE release'inin içine APK koymaz; Android Action yalnızca `android/**`, kendi workflow'u veya bu platform belgesi değiştiğinde çalışır.
