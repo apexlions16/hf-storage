@@ -65,7 +65,7 @@ jobs:
             --target x86_64 \
             --platform 26 \
             --output-dir ../app/src/main/jniLibs \
-            build --release
+            build --release 2>&1 | tee ../../xet-build.log
           cd ../..
           test -s android/app/src/main/jniLibs/arm64-v8a/libhfstorage_xet.so
           test -s android/app/src/main/jniLibs/x86_64/libhfstorage_xet.so
@@ -102,6 +102,7 @@ jobs:
         with:
           name: android-xet-build-diagnostics
           path: |
+            xet-build.log
             android-build.log
             apk-contents.txt
             android/xet-native/Cargo.lock
