@@ -29,7 +29,7 @@
 - Normal commit silme ve isteğe bağlı `lfs-files/batch` kalıcı geçmiş temizliği
 - Kullanıcı tarafından ayarlanabilir kapasite ve depolama progress barı
 - Yeni Model, Dataset veya Docker Space deposu oluşturma
-- Tokenı sansürleyen cihaz içi yükleme hata günlüğü
+- Tokenı sansürleyen ve `İndirilenler/HFStorage` içine aktarılabilen yükleme hata günlüğü
 
 ## Xet mimarisi
 
@@ -40,9 +40,18 @@ arm64-v8a/libhfstorage_xet.so
 x86_64/libhfstorage_xet.so
 ```
 
-Seçilen Android belgesi seekable bir dosya descriptor sağlıyorsa Xet dosyayı `/proc/self/fd/<id>` üzerinden doğrudan okur. Bulut belge sağlayıcısı yalnızca pipe sağlıyorsa dosya önce uygulamanın özel cache alanına akış halinde kopyalanır. Her iki durumda da ağ aktarımını ve deduplikasyonu Xet yapar.
+Android belge sağlayıcıları dosyaları çoğunlukla `content://` URI olarak verir. Samsung ve bazı diğer üreticilerin SELinux politikaları, uygulamanın açık dosya tanımlayıcısını `/proc/self/fd/<id>` yolundan Rust tarafında yeniden açmasını `Permission denied (os error 13)` ile engelleyebilir.
 
-Hub `preupload` yanıtı son Git commit girdisinin normal blob mu yoksa `lfsFile` pointer mı olacağını belirlemeye devam eder. Bu, Hugging Face'in masaüstü istemcisindeki Xet + commit davranışıyla aynıdır.
+Bu nedenle v0.1.3 ve sonrasında her boş olmayan belge Xet'e verilmeden önce uygulamanın özel staging alanına **akış halinde** kopyalanır:
+
+- Kopyalama 1 MiB tampon kullanır; dosyanın tamamı RAM'e alınmaz.
+- `externalCacheDir` ve `cacheDir` arasından en fazla kullanılabilir alana sahip konum seçilir.
+- Kopyalanan boyut kaynak boyutuyla doğrulanır ve disk tamponu `fsync` ile tamamlanır.
+- Xet yalnızca uygulamaya ait normal dosya yolunu okur.
+- Upload tamamlandığında veya hata verdiğinde staging klasörü silinir.
+- Yeterli boş alan yoksa yükleme başlamadan anlaşılır hata döndürülür.
+
+Hub `preupload` yanıtı son Git commit girdisinin normal blob mu yoksa `lfsFile` pointer mı olacağını belirlemeye devam eder. Ağ aktarımı ve deduplikasyon zorunlu Xet çekirdeği tarafından yapılır; Git LFS HTTP upload fallback'i yoktur.
 
 ## Yerel derleme
 
@@ -62,6 +71,7 @@ cd android/xet-native
 cargo ndk --target arm64-v8a --target x86_64 --platform 26 \
   --output-dir ../app/src/main/jniLibs build --release
 cd ../..
+python android/scripts/prepare_rustls_platform_verifier.py
 gradle -p android :app:testDebugUnitTest :app:assembleDebug
 ```
 

@@ -74,6 +74,10 @@ data class UploadMetadata(
     var uploadMode: String = "regular",
     var shouldIgnore: Boolean = false,
     var remoteOid: String? = null,
+    // Android content:// belgeleri Xet'e verilmeden önce uygulamaya ait normal
+    // bir dosya yoluna akış halinde hazırlanır. Bu alan yalnızca aktif upload
+    // işlemi boyunca yaşar ve iş bitince staging klasörüyle birlikte silinir.
+    var stagedPath: String? = null,
 )
 
 fun Uri.persistableString(): String = toString()

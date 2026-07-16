@@ -2,9 +2,6 @@ package com.apexlions.hfstorage.mobile.data
 
 import android.content.Context
 import android.net.Uri
-import android.os.ParcelFileDescriptor
-import android.system.Os
-import android.system.OsConstants
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -62,19 +59,32 @@ class UploadEngine(
             fetchUploadModes(repository, metadata, job.destination)
             val active = metadata.filterNot { it.shouldIgnore }
             val xetFiles = active.filter { it.size > 0L }
-
-            if (xetFiles.isNotEmpty()) {
+            val sources = if (xetFiles.isNotEmpty()) {
                 progress(
                     UploadProgress(
-                        "Xet",
+                        "Xet hazırlığı",
                         completed,
                         job.items.size,
-                        "${xetFiles.size} dosya Xet ile parçalanıyor ve yinelenen bloklar ayıklanıyor$suffix",
+                        "${xetFiles.size} dosya güvenli Xet staging alanına hazırlanıyor$suffix",
                     ),
                 )
                 NativeSourceGroup.open(context, xetFiles, "${job.id}-$chunkIndex") { current, total, name ->
                     progress(UploadProgress("Xet hazırlığı", completed + current, job.items.size, "$name ($current/$total)"))
-                }.use { sources ->
+                }
+            } else {
+                null
+            }
+
+            try {
+                if (sources != null) {
+                    progress(
+                        UploadProgress(
+                            "Xet",
+                            completed,
+                            job.items.size,
+                            "${xetFiles.size} dosya Xet ile parçalanıyor ve yinelenen bloklar ayıklanıyor$suffix",
+                        ),
+                    )
                     val results = XetNative.uploadFiles(
                         context = context,
                         refreshUrl = xetWriteTokenUrl(repository),
@@ -100,16 +110,18 @@ class UploadEngine(
                         file.xetHash = result.xetHash
                     }
                 }
-            }
 
-            // Empty files cannot be represented by Xet/LFS and are required by
-            // the Hub to stay regular Git blobs. They contain no transferable data.
-            active.filter { it.size == 0L }.forEach { it.uploadMode = "regular" }
+                // Empty files cannot be represented by Xet/LFS and are required by
+                // the Hub to stay regular Git blobs. They contain no transferable data.
+                active.filter { it.size == 0L }.forEach { it.uploadMode = "regular" }
 
-            if (active.isNotEmpty()) {
-                progress(UploadProgress("Commit", completed, job.items.size, "Tek batch commit oluşturuluyor$suffix"))
-                val commit = createCommit(repository, active, job.destination, job.commitMessage + suffix)
-                commits += commit
+                if (active.isNotEmpty()) {
+                    progress(UploadProgress("Commit", completed, job.items.size, "Tek batch commit oluşturuluyor$suffix"))
+                    val commit = createCommit(repository, active, job.destination, job.commitMessage + suffix)
+                    commits += commit
+                }
+            } finally {
+                sources?.close()
             }
 
             completed += items.size
@@ -169,7 +181,7 @@ class UploadEngine(
             val request = Request.Builder()
                 .url(url)
                 .header("Authorization", api.authHeader())
-                .header("User-Agent", "hf-storage-android/0.1.1")
+                .header("User-Agent", "hf-storage-android/0.1.3")
                 .post(payload.toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
             val response = api.executeJson(request).jsonObject
@@ -207,7 +219,11 @@ class UploadEngine(
                 lines += "{\"key\":\"lfsFile\",\"value\":{\"path\":${path.jsonQuote()}," +
                     "\"algo\":\"sha256\",\"oid\":${file.sha256.jsonQuote()},\"size\":${file.size}}}"
             } else {
-                val bytes = resolver.openInputStream(Uri.parse(file.item.uri))?.use { it.readBytes() }
+                val bytes = file.stagedPath?.let { staged ->
+                    val stagedFile = File(staged)
+                    if (!stagedFile.isFile) throw IOException("Hazırlanan dosya bulunamadı: ${file.item.displayName}")
+                    stagedFile.readBytes()
+                } ?: resolver.openInputStream(Uri.parse(file.item.uri))?.use { it.readBytes() }
                     ?: throw IOException("Dosya açılamadı: ${file.item.displayName}")
                 val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
                 lines += "{\"key\":\"file\",\"value\":{\"content\":${base64.jsonQuote()}," +
@@ -220,21 +236,29 @@ class UploadEngine(
 }
 
 /**
- * Keeps seekable document descriptors open while Rust reads /proc/self/fd/N.
- * Providers that only expose a non-seekable pipe are copied to the app-private
- * cache first; Xet remains the uploader in both cases.
+ * Android document providers return content:// handles whose backing descriptor
+ * is not guaranteed to be reopenable through /proc/self/fd. Samsung and other
+ * OEM SELinux policies can reject that path with EACCES even in the same app.
+ *
+ * To keep Xet mandatory and reliable, every non-empty source is copied with a
+ * bounded 1 MiB buffer to an app-private regular file first. Xet then reads only
+ * that normal path. The source is never loaded into RAM as a whole and staging
+ * is deleted in close(), including error paths.
  */
 private class NativeSourceGroup(
     val paths: List<String>,
-    private val descriptors: List<ParcelFileDescriptor>,
-    private val temporaryRoot: File?,
+    private val metadata: List<UploadMetadata>,
+    private val temporaryRoot: File,
 ) : Closeable {
     override fun close() {
-        descriptors.forEach { runCatching { it.close() } }
-        temporaryRoot?.deleteRecursively()
+        metadata.forEach { it.stagedPath = null }
+        temporaryRoot.deleteRecursively()
     }
 
     companion object {
+        private const val COPY_BUFFER_BYTES = 1024 * 1024
+        private const val MIN_FREE_RESERVE_BYTES = 64L * 1024L * 1024L
+
         fun open(
             context: Context,
             files: List<UploadMetadata>,
@@ -242,75 +266,76 @@ private class NativeSourceGroup(
             onPreparing: (current: Int, total: Int, name: String) -> Unit,
         ): NativeSourceGroup {
             val resolver = context.contentResolver
-            val descriptors = mutableListOf<ParcelFileDescriptor>()
-            val paths = mutableListOf<String>()
-            var temporaryRoot: File? = null
+            val requiredBytes = files.fold(0L) { total, file ->
+                if (Long.MAX_VALUE - total < file.size) Long.MAX_VALUE else total + file.size
+            }
+            val base = chooseStagingBase(context, requiredBytes)
+            val root = File(base, "hf-storage-staging/$jobPartId")
+            root.deleteRecursively()
+            if (!root.mkdirs() && !root.isDirectory) {
+                throw IOException("Xet geçici klasörü oluşturulamadı: ${root.absolutePath}")
+            }
 
+            val paths = mutableListOf<String>()
             try {
-                files.forEachIndexed { index, metadata ->
-                    onPreparing(index + 1, files.size, metadata.item.displayName)
-                    val uri = Uri.parse(metadata.item.uri)
-                    val descriptor = openSeekableDescriptor(resolver, uri, metadata.size)
-                    if (descriptor != null) {
-                        descriptors += descriptor
-                        paths += "/proc/self/fd/${descriptor.fd}"
-                    } else {
-                        val root = temporaryRoot ?: File(context.cacheDir, "hf-storage-staging/$jobPartId").also {
-                            it.deleteRecursively()
-                            if (!it.mkdirs() && !it.isDirectory) {
-                                throw IOException("Xet geçici klasörü oluşturulamadı: ${it.absolutePath}")
-                            }
-                            temporaryRoot = it
+                files.forEachIndexed { index, file ->
+                    onPreparing(index + 1, files.size, file.item.displayName)
+                    val uri = Uri.parse(file.item.uri)
+                    val safeName = file.item.displayName
+                        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                        .takeLast(120)
+                        .ifBlank { "file" }
+                    val target = File(root, "${index.toString().padStart(4, '0')}-$safeName")
+                    val part = File(root, target.name + ".part")
+
+                    resolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(part).use { output ->
+                            input.copyTo(output, COPY_BUFFER_BYTES)
+                            output.flush()
+                            output.fd.sync()
                         }
-                        val safeName = metadata.item.displayName
-                            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-                            .takeLast(120)
-                            .ifBlank { "file" }
-                        val target = File(root, "${index.toString().padStart(4, '0')}-$safeName")
-                        val part = File(root, target.name + ".part")
-                        resolver.openInputStream(uri)?.use { input ->
-                            FileOutputStream(part).use { output -> input.copyTo(output, 1024 * 1024) }
-                        } ?: throw IOException("Dosya Xet için açılamadı: ${metadata.item.displayName}")
-                        if (part.length() != metadata.size) {
-                            throw IOException(
-                                "Xet geçici kopyası eksik: ${metadata.item.displayName} " +
-                                    "(${metadata.size} yerine ${part.length()} bayt).",
-                            )
-                        }
-                        if (!part.renameTo(target)) {
-                            part.copyTo(target, overwrite = true)
-                            part.delete()
-                        }
-                        paths += target.absolutePath
+                    } ?: throw IOException("Dosya Xet için açılamadı: ${file.item.displayName}")
+
+                    if (part.length() != file.size) {
+                        throw IOException(
+                            "Xet geçici kopyası eksik: ${file.item.displayName} " +
+                                "(${file.size} yerine ${part.length()} bayt).",
+                        )
                     }
+                    if (!part.renameTo(target)) {
+                        part.copyTo(target, overwrite = true)
+                        part.delete()
+                    }
+                    if (!target.isFile || target.length() != file.size) {
+                        throw IOException("Xet staging doğrulaması başarısız: ${file.item.displayName}")
+                    }
+
+                    file.stagedPath = target.canonicalPath
+                    paths += target.canonicalPath
                 }
-                return NativeSourceGroup(paths, descriptors, temporaryRoot)
+                return NativeSourceGroup(paths, files, root)
             } catch (error: Throwable) {
-                descriptors.forEach { runCatching { it.close() } }
-                temporaryRoot?.deleteRecursively()
+                files.forEach { it.stagedPath = null }
+                root.deleteRecursively()
                 throw error
             }
         }
 
-        private fun openSeekableDescriptor(
-            resolver: android.content.ContentResolver,
-            uri: Uri,
-            expectedSize: Long,
-        ): ParcelFileDescriptor? {
-            val descriptor = runCatching { resolver.openFileDescriptor(uri, "r") }.getOrNull() ?: return null
-            return try {
-                val size = descriptor.statSize
-                if (size < 0L || size != expectedSize) {
-                    descriptor.close()
-                    null
-                } else {
-                    Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_SET)
-                    descriptor
-                }
-            } catch (_: Throwable) {
-                runCatching { descriptor.close() }
-                null
+        private fun chooseStagingBase(context: Context, requiredBytes: Long): File {
+            val candidates = listOfNotNull(context.externalCacheDir, context.cacheDir)
+                .distinctBy { it.absolutePath }
+                .filter { (it.exists() || it.mkdirs()) && it.isDirectory }
+            val selected = candidates.maxByOrNull { it.usableSpace }
+                ?: throw IOException("Xet staging alanı bulunamadı.")
+            val reserve = MIN_FREE_RESERVE_BYTES.coerceAtMost((requiredBytes / 10L).coerceAtLeast(8L * 1024L * 1024L))
+            val needed = if (Long.MAX_VALUE - requiredBytes < reserve) Long.MAX_VALUE else requiredBytes + reserve
+            if (selected.usableSpace < needed) {
+                throw IOException(
+                    "Xet hazırlığı için telefonda yeterli boş alan yok. " +
+                        "Gerekli yaklaşık alan: ${formatBytes(needed)}, kullanılabilir: ${formatBytes(selected.usableSpace)}.",
+                )
             }
+            return selected
         }
     }
 }
@@ -319,7 +344,7 @@ private fun HfApiClient.postCommitBlocking(repository: Repository, ndjson: Strin
     val url = "${HfApiClient.ENDPOINT}/api/${repository.type.apiSegment}/${repository.id}/commit/main"
     val request = Request.Builder().url(url)
         .header("Authorization", authHeader())
-        .header("User-Agent", "hf-storage-android/0.1.1")
+        .header("User-Agent", "hf-storage-android/0.1.3")
         .header("Content-Type", "application/x-ndjson")
         .post(ndjson.toRequestBody("application/x-ndjson".toMediaTypeOrNull()))
         .build()
