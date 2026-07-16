@@ -93,6 +93,17 @@ jobs:
             exit 1
           fi
 
+      - name: Verify canonical Hub commit guard source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          GUARD=android/app/src/main/java/com/apexlions/hfstorage/mobile/data/CommitRequestCanonicalizer.kt
+          CLIENT=android/app/src/main/java/com/apexlions/hfstorage/mobile/data/HfApiClient.kt
+          test -s "$GUARD"
+          grep -q 'canonicalizeCommitNdjson' "$GUARD"
+          grep -q 'put("summary", summary)' "$GUARD"
+          grep -q 'withCanonicalCommitBody' "$CLIENT"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -125,6 +136,7 @@ jobs:
           grep -q 'org/rustls/platformverifier' dex-strings.txt
           grep -q 'nativeInitialize' dex-strings.txt
           grep -q 'hf-storage-staging' dex-strings.txt
+          grep -q 'canonicalizeCommitNdjson' dex-strings.txt
 
       - name: Upload build diagnostics
         if: failure()
@@ -145,55 +157,55 @@ jobs:
       - name: Prepare release asset
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.3.apk
-          sha256sum dist/HFStorage-Android-v0.1.3.apk > dist/HFStorage-Android-v0.1.3.apk.sha256
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.4.apk
+          sha256sum dist/HFStorage-Android-v0.1.4.apk > dist/HFStorage-Android-v0.1.4.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HFStorage-Android-v0.1.3
+          name: HFStorage-Android-v0.1.4
           path: |
-            dist/HFStorage-Android-v0.1.3.apk
-            dist/HFStorage-Android-v0.1.3.apk.sha256
+            dist/HFStorage-Android-v0.1.4.apk
+            dist/HFStorage-Android-v0.1.4.apk.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish Android v0.1.3 release
-        if: (github.event_name == 'pull_request' && github.head_ref == 'fix/android-selinux-staging-v0.1.3') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
+      - name: Publish Android v0.1.4 release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):')
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: android-v0.1.3
-          RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          RELEASE_TAG: android-v0.1.4
+          RELEASE_TARGET: ${{ github.sha }}
         run: |
           cat > android-release-notes.md <<'NOTES'
-          ## HF Storage Android v0.1.3
+          ## HF Storage Android v0.1.4
 
-          Samsung ve diğer sıkı SELinux politikalı Android cihazlarda Xet dosya okuma düzeltmesi.
+          Hugging Face commit isteği doğrulama düzeltmesi.
 
           ### Düzeltilen hata
-          - `/proc/self/fd/<n>` üzerinden Xet'e dosya verme yolu tamamen kaldırıldı.
-          - `Permission denied (os error 13)` ile sonuçlanan OEM/SELinux uyumsuzluğu giderildi.
-          - Her boş olmayan belge artık 1 MiB tamponla uygulamanın özel staging alanına akış halinde kopyalanır.
-          - Xet yalnızca doğrulanmış normal dosya yolunu okur; dosya bütünüyle RAM'e alınmaz.
-          - Staging için dahili ve harici uygulama cache alanlarından en fazla boş alana sahip olan seçilir.
-          - Yetersiz boş alan olduğunda anlaşılır hata gösterilir; işlem sonrasında geçici dosyalar temizlenir.
-          - Normal Git blobu gereken küçük dosyalar da aynı doğrulanmış staging kopyasından commit edilir.
+          - Xet yüklemesi tamamlandıktan sonra Hub commit API'sinin `value.summary` alanını eksik görerek HTTP 400 döndürmesi giderildi.
+          - Her `/commit/` isteğinin ilk NDJSON kaydı gönderilmeden hemen önce resmî `huggingface_hub` biçiminde yeniden oluşturulur.
+          - Header artık her zaman `key=header`, string `value.summary` ve string `value.description` içerir.
+          - UTF-8 BOM, eksik header ve boş summary durumları cihaz üzerinde düzeltilir.
+          - İstek gövdesi kesin UTF-8 baytları ve `application/x-ndjson` içerik türüyle gönderilir.
+          - Büyük dosya operasyon satırları yeniden Base64 çözülmez; yalnızca commit header kaydı kanonikleştirilir.
 
-          ### Korunan özellikler
-          - Resmî `hf-xet` Rust çekirdeği zorunludur; Git LFS upload fallback'i yoktur.
-          - Android rustls platform verifier başlangıcı korunur.
-          - 100 dosyaya kadar tek Hugging Face commit davranışı korunur.
-          - Okunabilir ve tokenı sansürlenmiş hata günlükleri `İndirilenler/HFStorage` içine aktarılır.
+          ### Testler
+          - Doğru header'ın korunması
+          - Eksik summary için güvenli varsayılan
+          - Header bulunmadığında otomatik ekleme
+          - UTF-8 BOM temizliği
+          - Zorunlu Xet, rustls verifier ve SELinux-safe staging kontrolleri korunur.
 
-          APK GitHub Actions tarafından test edilmiş, staging regresyon kontrolünden geçirilmiş ve debug anahtarıyla imzalanmıştır.
+          APK GitHub Actions tarafından test edilmiş ve debug anahtarıyla imzalanmıştır.
           NOTES
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.3.apk dist/HFStorage-Android-v0.1.3.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.4.apk dist/HFStorage-Android-v0.1.4.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.3.apk dist/HFStorage-Android-v0.1.3.apk.sha256 \
+            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.4.apk dist/HFStorage-Android-v0.1.4.apk.sha256 \
               --target "$RELEASE_TARGET" \
-              --title "HF Storage Android v0.1.3" \
+              --title "HF Storage Android v0.1.4" \
               --notes-file android-release-notes.md \
               --repo "$GITHUB_REPOSITORY"
           fi
