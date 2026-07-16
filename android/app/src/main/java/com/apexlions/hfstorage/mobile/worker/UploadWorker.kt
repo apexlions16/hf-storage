@@ -60,8 +60,8 @@ class UploadWorker(
                     .putInt(KEY_TOTAL, progress.total)
                     .putString(KEY_MESSAGE, progress.message)
                     .build()
-                setProgress(data)
-                setForeground(createForeground(id, progress.message, progress.current, progress.total))
+                setProgressAsync(data)
+                setForegroundAsync(createForeground(id, progress.message, progress.current, progress.total))
             }
             queue.delete(id)
             Result.success(
