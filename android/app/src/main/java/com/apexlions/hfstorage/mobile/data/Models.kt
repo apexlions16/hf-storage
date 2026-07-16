@@ -67,9 +67,10 @@ data class UploadProgress(
 
 data class UploadMetadata(
     val item: UploadItem,
-    val sha256: String,
+    var sha256: String = "",
     val sampleBase64: String,
     val size: Long,
+    var xetHash: String = "",
     var uploadMode: String = "regular",
     var shouldIgnore: Boolean = false,
     var remoteOid: String? = null,

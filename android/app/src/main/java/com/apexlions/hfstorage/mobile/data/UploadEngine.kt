@@ -1,7 +1,10 @@
 package com.apexlions.hfstorage.mobile.data
 
-import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -12,23 +15,37 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.longOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.BufferedSink
-import okio.source
+import java.io.Closeable
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
-import java.security.MessageDigest
-import kotlin.math.ceil
 
+/**
+ * Android upload pipeline.
+ *
+ * Every non-empty file is first ingested by the official hf-xet Rust client.
+ * There is deliberately no legacy Git-LFS upload fallback. The Hub preupload
+ * response still decides whether the final Git commit entry is a regular blob
+ * or an lfsFile pointer, exactly like huggingface_hub does on desktop.
+ */
 class UploadEngine(
-    private val resolver: ContentResolver,
+    private val context: Context,
     private val api: HfApiClient,
+    private val hubToken: String,
 ) {
+    private val resolver = context.contentResolver
+
     suspend fun upload(job: UploadJob, progress: (UploadProgress) -> Unit): List<String> = withContext(Dispatchers.IO) {
         if (job.items.isEmpty()) throw HfApiException("Yüklenecek dosya bulunamadı.")
+        if (!XetNative.isAvailable) {
+            throw HfApiException(
+                "Xet zorunlu fakat native Xet bileşeni yüklenemedi: ${XetNative.loadError ?: "bilinmeyen hata"}",
+            )
+        }
+
         val repository = Repository(job.repoId, RepoType.fromApi(job.repoType), isPrivate = false)
         val commits = mutableListOf<String>()
         val chunks = planCommitBatches(job.items)
@@ -39,66 +56,120 @@ class UploadEngine(
             progress(UploadProgress("Analiz", completed, job.items.size, "${items.size} dosya analiz ediliyor$suffix"))
             val metadata = items.mapIndexed { index, item ->
                 progress(UploadProgress("Analiz", completed + index, job.items.size, item.displayName))
-                calculateMetadata(item)
+                calculatePreuploadMetadata(item)
             }
 
             fetchUploadModes(repository, metadata, job.destination)
             val active = metadata.filterNot { it.shouldIgnore }
-            val lfs = active.filter { it.uploadMode == "lfs" }
-            if (lfs.isNotEmpty()) {
-                progress(UploadProgress("LFS", completed, job.items.size, "${lfs.size} büyük dosya hazırlanıyor$suffix"))
-                uploadLfs(repository, lfs) { currentName ->
-                    progress(UploadProgress("Yükleniyor", completed, job.items.size, currentName))
+            val xetFiles = active.filter { it.size > 0L }
+
+            if (xetFiles.isNotEmpty()) {
+                progress(
+                    UploadProgress(
+                        "Xet",
+                        completed,
+                        job.items.size,
+                        "${xetFiles.size} dosya Xet ile parçalanıyor ve yinelenen bloklar ayıklanıyor$suffix",
+                    ),
+                )
+                NativeSourceGroup.open(context, xetFiles, "${job.id}-$chunkIndex") { current, total, name ->
+                    progress(UploadProgress("Xet hazırlığı", completed + current, job.items.size, "$name ($current/$total)"))
+                }.use { sources ->
+                    val results = XetNative.uploadFiles(
+                        context = context,
+                        refreshUrl = xetWriteTokenUrl(repository),
+                        hubToken = hubToken,
+                        filePaths = sources.paths,
+                    )
+                    if (results.size != xetFiles.size) {
+                        throw HfApiException(
+                            "Xet ${xetFiles.size} dosya için ${results.size} sonuç döndürdü; commit güvenlik nedeniyle oluşturulmadı.",
+                        )
+                    }
+                    xetFiles.zip(results).forEach { (file, result) ->
+                        if (result.sha256.isBlank() || result.xetHash.isBlank()) {
+                            throw HfApiException("Xet eksik hash döndürdü: ${file.item.displayName}")
+                        }
+                        if (result.fileSize != file.size) {
+                            throw HfApiException(
+                                "Dosya Xet işlemi sırasında değişti: ${file.item.displayName} " +
+                                    "(${file.size} bayt bekleniyordu, ${result.fileSize} bayt okundu).",
+                            )
+                        }
+                        file.sha256 = result.sha256
+                        file.xetHash = result.xetHash
+                    }
                 }
             }
 
-            progress(UploadProgress("Commit", completed, job.items.size, "Tek batch commit oluşturuluyor$suffix"))
-            val commit = createCommit(repository, active, job.destination, job.commitMessage + suffix)
-            commits += commit
+            // Empty files cannot be represented by Xet/LFS and are required by
+            // the Hub to stay regular Git blobs. They contain no transferable data.
+            active.filter { it.size == 0L }.forEach { it.uploadMode = "regular" }
+
+            if (active.isNotEmpty()) {
+                progress(UploadProgress("Commit", completed, job.items.size, "Tek batch commit oluşturuluyor$suffix"))
+                val commit = createCommit(repository, active, job.destination, job.commitMessage + suffix)
+                commits += commit
+            }
+
             completed += items.size
-            progress(UploadProgress("Tamamlandı", completed, job.items.size, "$completed/${job.items.size} dosya commit edildi"))
+            progress(UploadProgress("Tamamlandı", completed, job.items.size, "$completed/${job.items.size} dosya işlendi"))
         }
         commits
     }
 
-    private fun calculateMetadata(item: UploadItem): UploadMetadata {
-        val digest = MessageDigest.getInstance("SHA-256")
+    private fun calculatePreuploadMetadata(item: UploadItem): UploadMetadata {
+        val uri = Uri.parse(item.uri)
         val sample = ByteArray(512)
-        var sampleCount = 0
+        val sampleCount = resolver.openInputStream(uri)?.use { input ->
+            var offset = 0
+            while (offset < sample.size) {
+                val read = input.read(sample, offset, sample.size - offset)
+                if (read < 0) break
+                offset += read
+            }
+            offset
+        } ?: throw IOException("Dosya açılamadı: ${item.displayName}")
+
+        val size = determineSize(uri, item)
+        return UploadMetadata(
+            item = item,
+            sampleBase64 = Base64.encodeToString(sample.copyOf(sampleCount), Base64.NO_WRAP),
+            size = size,
+        )
+    }
+
+    private fun determineSize(uri: Uri, item: UploadItem): Long {
+        if (item.size > 0L) return item.size
+        runCatching {
+            resolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                if (descriptor.statSize >= 0L) return descriptor.statSize
+            }
+        }
         var total = 0L
-        resolver.openInputStream(Uri.parse(item.uri))?.use { input ->
+        resolver.openInputStream(uri)?.use { input ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
                 val read = input.read(buffer)
                 if (read < 0) break
-                if (sampleCount < sample.size) {
-                    val copy = minOf(read, sample.size - sampleCount)
-                    buffer.copyInto(sample, sampleCount, 0, copy)
-                    sampleCount += copy
-                }
-                digest.update(buffer, 0, read)
                 total += read
             }
-        } ?: throw IOException("Dosya açılamadı: ${item.displayName}")
-        return UploadMetadata(
-            item = item,
-            sha256 = digest.digest().joinToString("") { "%02x".format(it) },
-            sampleBase64 = Base64.encodeToString(sample.copyOf(sampleCount), Base64.NO_WRAP),
-            size = total,
-        )
+        } ?: throw IOException("Dosya boyutu alınamadı: ${item.displayName}")
+        return total
     }
 
     private fun fetchUploadModes(repository: Repository, files: List<UploadMetadata>, destination: String) {
         files.chunked(256).forEach { chunk ->
             val fileJson = chunk.joinToString(",") {
-                "{\"path\":${normalizeRemotePath(destination, it.item.relativePath).jsonQuote()},\"sample\":${it.sampleBase64.jsonQuote()},\"size\":${it.size}}"
+                "{\"path\":${normalizeRemotePath(destination, it.item.relativePath).jsonQuote()}," +
+                    "\"sample\":${it.sampleBase64.jsonQuote()},\"size\":${it.size}}"
             }
             val payload = "{\"files\":[$fileJson]}"
             val url = "${HfApiClient.ENDPOINT}/api/${repository.type.apiSegment}/${repository.id}/preupload/main"
             val request = Request.Builder()
                 .url(url)
                 .header("Authorization", api.authHeader())
-                .header("User-Agent", "hf-storage-android/0.1.0")
+                .header("User-Agent", "hf-storage-android/0.1.1")
                 .post(payload.toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
             val response = api.executeJson(request).jsonObject
@@ -116,106 +187,8 @@ class UploadEngine(
         }
     }
 
-    private fun uploadLfs(
-        repository: Repository,
-        files: List<UploadMetadata>,
-        onFile: (String) -> Unit,
-    ) {
-        files.chunked(100).forEach { chunk ->
-            val objects = chunk.joinToString(",") { "{\"oid\":${it.sha256.jsonQuote()},\"size\":${it.size}}" }
-            val payload = "{\"operation\":\"upload\",\"transfers\":[\"basic\",\"multipart\"],\"objects\":[$objects],\"hash_algo\":\"sha256\",\"ref\":{\"name\":\"main\"}}"
-            val prefix = if (repository.type == RepoType.MODEL) "" else "${repository.type.apiSegment}/"
-            val url = "${HfApiClient.ENDPOINT}/$prefix${repository.id}.git/info/lfs/objects/batch"
-            val request = Request.Builder()
-                .url(url)
-                .header("Authorization", api.authHeader())
-                .header("Accept", "application/vnd.git-lfs+json")
-                .header("Content-Type", "application/vnd.git-lfs+json")
-                .post(payload.toRequestBody("application/vnd.git-lfs+json".toMediaTypeOrNull()))
-                .build()
-            val root = api.executeJson(request).jsonObject
-            val objectsResponse = root["objects"]?.jsonArray ?: JsonArray(emptyList())
-            val byOid = chunk.associateBy { it.sha256 }
-            objectsResponse.forEach { element ->
-                val obj = element.jsonObject
-                obj["error"]?.let { throw HfApiException("LFS: ${it.jsonObject.string("message") ?: it}") }
-                val oid = obj.string("oid") ?: return@forEach
-                val metadata = byOid[oid] ?: return@forEach
-                onFile(metadata.item.displayName)
-                val actions = obj["actions"]?.jsonObject ?: return@forEach
-                val upload = actions["upload"]?.jsonObject ?: return@forEach
-                uploadLfsObject(metadata, upload)
-                actions["verify"]?.jsonObject?.let { verifyLfs(metadata, it) }
-            }
-        }
-    }
-
-    private fun uploadLfsObject(file: UploadMetadata, action: JsonObject) {
-        val href = action.string("href") ?: throw HfApiException("LFS upload URL eksik.")
-        val header = action["header"]?.jsonObject ?: JsonObject(emptyMap())
-        val chunkSize = header["chunk_size"]?.jsonPrimitive?.longOrNull
-        if (chunkSize == null) {
-            val body = UriRequestBody(resolver, Uri.parse(file.item.uri), file.size)
-            executePutWithRetry(href, body).close()
-            return
-        }
-
-        val partUrls = header.entries.mapNotNull { (key, value) ->
-            key.toIntOrNull()?.let { it to value.jsonPrimitive.content }
-        }.sortedBy { it.first }.map { it.second }
-        val expected = ceil(file.size.toDouble() / chunkSize.toDouble()).toInt()
-        if (partUrls.size != expected) throw HfApiException("LFS multipart yanıtı geçersiz: $expected parça bekleniyordu.")
-        val etags = partUrls.mapIndexed { index, partUrl ->
-            val offset = index * chunkSize
-            val length = minOf(chunkSize, file.size - offset)
-            val response = executePutWithRetry(
-                partUrl,
-                UriSliceRequestBody(resolver, Uri.parse(file.item.uri), offset, length),
-            )
-            val etag = response.header("ETag")
-            response.close()
-            etag ?: throw HfApiException("LFS parçası ETag döndürmedi.")
-        }
-        val parts = etags.mapIndexed { index, etag ->
-            "{\"partNumber\":${index + 1},\"etag\":${etag.jsonQuote()}}"
-        }.joinToString(",")
-        val completion = "{\"oid\":${file.sha256.jsonQuote()},\"parts\":[$parts]}"
-        val request = Request.Builder().url(href)
-            .header("Accept", "application/vnd.git-lfs+json")
-            .header("Content-Type", "application/vnd.git-lfs+json")
-            .post(completion.toRequestBody("application/vnd.git-lfs+json".toMediaTypeOrNull()))
-            .build()
-        api.executeRaw(request).close()
-    }
-
-    private fun executePutWithRetry(url: String, body: RequestBody): okhttp3.Response {
-        var last: Throwable? = null
-        repeat(3) { attempt ->
-            try {
-                val response = api.client.newCall(Request.Builder().url(url).put(body).build()).execute()
-                if (response.isSuccessful) return response
-                val message = response.body?.string().orEmpty()
-                response.close()
-                if (response.code !in 500..599) throw HfApiException("Dosya aktarımı başarısız (${response.code}): $message", response.code)
-                last = HfApiException("Geçici aktarım hatası (${response.code})")
-            } catch (error: Throwable) {
-                last = error
-                if (attempt == 2) throw error
-                Thread.sleep((attempt + 1) * 1000L)
-            }
-        }
-        throw last ?: HfApiException("Dosya aktarılamadı.")
-    }
-
-    private fun verifyLfs(file: UploadMetadata, action: JsonObject) {
-        val href = action.string("href") ?: return
-        val payload = "{\"oid\":${file.sha256.jsonQuote()},\"size\":${file.size}}"
-        val request = Request.Builder().url(href)
-            .header("Authorization", api.authHeader())
-            .post(payload.toRequestBody("application/json".toMediaTypeOrNull()))
-            .build()
-        api.executeRaw(request).close()
-    }
+    private fun xetWriteTokenUrl(repository: Repository): String =
+        "${HfApiClient.ENDPOINT}/api/${repository.type.apiSegment}/${repository.id}/xet-write-token/main"
 
     private fun createCommit(
         repository: Repository,
@@ -223,78 +196,134 @@ class UploadEngine(
         destination: String,
         message: String,
     ): String {
+        val safeMessage = message.trim().ifBlank { "Batch upload with HF Storage Android" }
         val lines = mutableListOf(
-            "{\"key\":\"header\",\"value\":{\"summary\":${message.jsonQuote()},\"description\":\"\"}}",
+            "{\"key\":\"header\",\"value\":{\"summary\":${safeMessage.jsonQuote()},\"description\":\"\"}}",
         )
         files.forEach { file ->
             val path = normalizeRemotePath(destination, file.item.relativePath)
             if (file.uploadMode == "lfs") {
-                lines += "{\"key\":\"lfsFile\",\"value\":{\"path\":${path.jsonQuote()},\"algo\":\"sha256\",\"oid\":${file.sha256.jsonQuote()},\"size\":${file.size}}}"
+                if (file.sha256.isBlank()) throw HfApiException("Xet SHA-256 eksik: ${file.item.displayName}")
+                lines += "{\"key\":\"lfsFile\",\"value\":{\"path\":${path.jsonQuote()}," +
+                    "\"algo\":\"sha256\",\"oid\":${file.sha256.jsonQuote()},\"size\":${file.size}}}"
             } else {
                 val bytes = resolver.openInputStream(Uri.parse(file.item.uri))?.use { it.readBytes() }
                     ?: throw IOException("Dosya açılamadı: ${file.item.displayName}")
                 val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                lines += "{\"key\":\"file\",\"value\":{\"content\":${base64.jsonQuote()},\"path\":${path.jsonQuote()},\"encoding\":\"base64\"}}"
+                lines += "{\"key\":\"file\",\"value\":{\"content\":${base64.jsonQuote()}," +
+                    "\"path\":${path.jsonQuote()},\"encoding\":\"base64\"}}"
             }
         }
         val result = api.postCommitBlocking(repository, lines.joinToString("\n", postfix = "\n"))
         return result.string("commitUrl") ?: result.string("commitOid") ?: repository.id
     }
+}
 
+/**
+ * Keeps seekable document descriptors open while Rust reads /proc/self/fd/N.
+ * Providers that only expose a non-seekable pipe are copied to the app-private
+ * cache first; Xet remains the uploader in both cases.
+ */
+private class NativeSourceGroup(
+    val paths: List<String>,
+    private val descriptors: List<ParcelFileDescriptor>,
+    private val temporaryRoot: File?,
+) : Closeable {
+    override fun close() {
+        descriptors.forEach { runCatching { it.close() } }
+        temporaryRoot?.deleteRecursively()
+    }
+
+    companion object {
+        fun open(
+            context: Context,
+            files: List<UploadMetadata>,
+            jobPartId: String,
+            onPreparing: (current: Int, total: Int, name: String) -> Unit,
+        ): NativeSourceGroup {
+            val resolver = context.contentResolver
+            val descriptors = mutableListOf<ParcelFileDescriptor>()
+            val paths = mutableListOf<String>()
+            var temporaryRoot: File? = null
+
+            try {
+                files.forEachIndexed { index, metadata ->
+                    onPreparing(index + 1, files.size, metadata.item.displayName)
+                    val uri = Uri.parse(metadata.item.uri)
+                    val descriptor = openSeekableDescriptor(resolver, uri, metadata.size)
+                    if (descriptor != null) {
+                        descriptors += descriptor
+                        paths += "/proc/self/fd/${descriptor.fd}"
+                    } else {
+                        val root = temporaryRoot ?: File(context.cacheDir, "hf-storage-staging/$jobPartId").also {
+                            it.deleteRecursively()
+                            if (!it.mkdirs() && !it.isDirectory) {
+                                throw IOException("Xet geçici klasörü oluşturulamadı: ${it.absolutePath}")
+                            }
+                            temporaryRoot = it
+                        }
+                        val safeName = metadata.item.displayName
+                            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                            .takeLast(120)
+                            .ifBlank { "file" }
+                        val target = File(root, "${index.toString().padStart(4, '0')}-$safeName")
+                        val part = File(root, target.name + ".part")
+                        resolver.openInputStream(uri)?.use { input ->
+                            FileOutputStream(part).use { output -> input.copyTo(output, 1024 * 1024) }
+                        } ?: throw IOException("Dosya Xet için açılamadı: ${metadata.item.displayName}")
+                        if (part.length() != metadata.size) {
+                            throw IOException(
+                                "Xet geçici kopyası eksik: ${metadata.item.displayName} " +
+                                    "(${metadata.size} yerine ${part.length()} bayt).",
+                            )
+                        }
+                        if (!part.renameTo(target)) {
+                            part.copyTo(target, overwrite = true)
+                            part.delete()
+                        }
+                        paths += target.absolutePath
+                    }
+                }
+                return NativeSourceGroup(paths, descriptors, temporaryRoot)
+            } catch (error: Throwable) {
+                descriptors.forEach { runCatching { it.close() } }
+                temporaryRoot?.deleteRecursively()
+                throw error
+            }
+        }
+
+        private fun openSeekableDescriptor(
+            resolver: android.content.ContentResolver,
+            uri: Uri,
+            expectedSize: Long,
+        ): ParcelFileDescriptor? {
+            val descriptor = runCatching { resolver.openFileDescriptor(uri, "r") }.getOrNull() ?: return null
+            return try {
+                val size = descriptor.statSize
+                if (size < 0L || size != expectedSize) {
+                    descriptor.close()
+                    null
+                } else {
+                    Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_SET)
+                    descriptor
+                }
+            } catch (_: Throwable) {
+                runCatching { descriptor.close() }
+                null
+            }
+        }
+    }
 }
 
 private fun HfApiClient.postCommitBlocking(repository: Repository, ndjson: String): JsonObject {
     val url = "${HfApiClient.ENDPOINT}/api/${repository.type.apiSegment}/${repository.id}/commit/main"
     val request = Request.Builder().url(url)
         .header("Authorization", authHeader())
-        .header("User-Agent", "hf-storage-android/0.1.0")
+        .header("User-Agent", "hf-storage-android/0.1.1")
         .header("Content-Type", "application/x-ndjson")
         .post(ndjson.toRequestBody("application/x-ndjson".toMediaTypeOrNull()))
         .build()
     return executeJson(request).jsonObject
-}
-
-private class UriRequestBody(
-    private val resolver: ContentResolver,
-    private val uri: Uri,
-    private val length: Long,
-) : RequestBody() {
-    override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
-    override fun contentLength(): Long = length
-    override fun writeTo(sink: BufferedSink) {
-        resolver.openInputStream(uri)?.use { input -> sink.writeAll(input.source()) }
-            ?: throw IOException("Dosya açılamadı: $uri")
-    }
-}
-
-private class UriSliceRequestBody(
-    private val resolver: ContentResolver,
-    private val uri: Uri,
-    private val offset: Long,
-    private val length: Long,
-) : RequestBody() {
-    override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
-    override fun contentLength(): Long = length
-    override fun writeTo(sink: BufferedSink) {
-        resolver.openInputStream(uri)?.use { input ->
-            var remainingSkip = offset
-            while (remainingSkip > 0) {
-                val skipped = input.skip(remainingSkip)
-                if (skipped <= 0) {
-                    if (input.read() == -1) throw IOException("Dosya parçasına erişilemedi.")
-                    remainingSkip--
-                } else remainingSkip -= skipped
-            }
-            var remaining = length
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (remaining > 0) {
-                val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                if (read < 0) throw IOException("Dosya beklenenden kısa.")
-                sink.write(buffer, 0, read)
-                remaining -= read
-            }
-        } ?: throw IOException("Dosya açılamadı: $uri")
-    }
 }
 
 private fun JsonObject.string(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull

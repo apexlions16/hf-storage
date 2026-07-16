@@ -7,10 +7,11 @@
 - Kotlin
 - Jetpack Compose + Material 3
 - OkHttp
-- WorkManager foreground upload
+- WorkManager `dataSync` foreground upload
 - Storage Access Framework
 - Android Keystore AES-GCM
-- Hugging Face Hub REST, commit ve Git LFS HTTP API'leri
+- Hugging Face Hub REST ve commit API'leri
+- Resmî `hf-xet` Rust çekirdeği için JNI köprüsü
 
 ## Mobil özellikler
 
@@ -20,16 +21,47 @@
 - Depo dosya ağacı, dosya türü, boyut ve Git/LFS/Xet bilgisinin gösterilmesi
 - Dosya ve klasör seçimi
 - 100 dosyaya kadar tek commit; 101 ve üzeri dosyada 100'lük commit parçaları
-- Büyük dosyalarda LFS basic ve multipart upload
+- Sıfır bayt dışındaki bütün yüklemelerde zorunlu Xet parçalama, deduplikasyon ve CAS aktarımı
+- Git LFS HTTP upload fallback'i bulunmaması
 - WorkManager sayesinde uygulama arka plana geçtiğinde devam eden aktarım
+- Android 14-16 için `FOREGROUND_SERVICE_TYPE_DATA_SYNC` desteği
 - Dosya indirme
 - Normal commit silme ve isteğe bağlı `lfs-files/batch` kalıcı geçmiş temizliği
 - Kullanıcı tarafından ayarlanabilir kapasite ve depolama progress barı
 - Yeni Model, Dataset veya Docker Space deposu oluşturma
+- Tokenı sansürleyen cihaz içi yükleme hata günlüğü
 
-## Derleme
+## Xet mimarisi
+
+Android uygulaması `android/xet-native/` içindeki Rust `cdylib` projesini iki mimari için üretir:
+
+```text
+arm64-v8a/libhfstorage_xet.so
+x86_64/libhfstorage_xet.so
+```
+
+Seçilen Android belgesi seekable bir dosya descriptor sağlıyorsa Xet dosyayı `/proc/self/fd/<id>` üzerinden doğrudan okur. Bulut belge sağlayıcısı yalnızca pipe sağlıyorsa dosya önce uygulamanın özel cache alanına akış halinde kopyalanır. Her iki durumda da ağ aktarımını ve deduplikasyonu Xet yapar.
+
+Hub `preupload` yanıtı son Git commit girdisinin normal blob mu yoksa `lfsFile` pointer mı olacağını belirlemeye devam eder. Bu, Hugging Face'in masaüstü istemcisindeki Xet + commit davranışıyla aynıdır.
+
+## Yerel derleme
+
+Gereksinimler:
+
+- Java 17
+- Android SDK 35
+- Android NDK 27.2.12479018
+- Rust stable
+- `cargo-ndk`
+- Gradle 8.9
 
 ```bash
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk --locked
+cd android/xet-native
+cargo ndk --target arm64-v8a --target x86_64 --platform 26 \
+  --output-dir ../app/src/main/jniLibs build --release
+cd ../..
 gradle -p android :app:testDebugUnitTest :app:assembleDebug
 ```
 
@@ -41,6 +73,6 @@ android/app/build/outputs/apk/debug/app-debug.apk
 
 ## Güvenlik notları
 
-Token hiçbir geliştirici sunucusuna gönderilmez. Android uygulaması yalnızca `https://huggingface.co` ve Hugging Face'in LFS yükleme sırasında verdiği imzalı depolama URL'leriyle iletişim kurar.
+Token hiçbir geliştirici sunucusuna gönderilmez. Hub tokenı yalnızca Hugging Face API ve Xet write-token yenileme adresine gönderilir. Xet CAS istekleri, Hub tarafından verilen kısa ömürlü Xet erişim tokenını kullanır. Telemetri kapalıdır.
 
-İlk GitHub sürümü, özel bir üretim imzalama anahtarı repoya eklenmediği için Android debug anahtarıyla imzalanır. APK kurulabilir; ancak gelecekte Play Store veya kesintisiz uygulama güncellemeleri için GitHub Actions Secrets içinde kalıcı bir üretim keystore'u tanımlanmalıdır.
+GitHub sürümü, özel bir üretim imzalama anahtarı repoya eklenmediği için Android debug anahtarıyla imzalanır. APK kurulabilir; ancak gelecekte Play Store veya kesintisiz uygulama güncellemeleri için GitHub Actions Secrets içinde kalıcı bir üretim keystore'u tanımlanmalıdır.

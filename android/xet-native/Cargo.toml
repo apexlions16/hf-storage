@@ -1,0 +1,29 @@
+[package]
+name = "hfstorage-xet-android"
+version = "0.1.1"
+edition = "2024"
+publish = false
+
+[lib]
+name = "hfstorage_xet"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+xet = { package = "hf-xet", version = "=1.5.1" }
+
+# hf-xet 1.5.1 declares its internal crates with a semver-compatible range,
+# but the newer 1.5.3 internal APIs are not source-compatible with 1.5.1.
+# Pinning the whole family prevents Cargo from mixing those releases.
+xet-client = "=1.5.1"
+xet-core-structures = "=1.5.1"
+xet-data = "=1.5.1"
+xet-runtime = "=1.5.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

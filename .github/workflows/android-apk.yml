@@ -20,7 +20,7 @@ permissions:
 jobs:
   android:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -35,8 +35,41 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android platform
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Install Android platform and NDK
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Set up Rust for Android
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/xet-native
+          cache-on-failure: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build mandatory native Xet library
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          set -euxo pipefail
+          rm -rf android/app/src/main/jniLibs
+          cd android/xet-native
+          cargo ndk \
+            --target arm64-v8a \
+            --target x86_64 \
+            --platform 26 \
+            --output-dir ../app/src/main/jniLibs \
+            build --release 2>&1 | tee ../../xet-build.log
+          cd ../..
+          test -s android/app/src/main/jniLibs/arm64-v8a/libhfstorage_xet.so
+          test -s android/app/src/main/jniLibs/x86_64/libhfstorage_xet.so
+          find android/app/src/main/jniLibs -type f -name '*.so' -print -exec file {} \;
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -49,67 +82,83 @@ jobs:
           set -o pipefail
           gradle -p android :app:testDebugUnitTest --stacktrace 2>&1 | tee android-build.log
 
+      - name: Build installable APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p android :app:assembleDebug --stacktrace 2>&1 | tee -a android-build.log
+
+      - name: Verify Xet is packaged in APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | tee apk-contents.txt
+          grep -q 'lib/arm64-v8a/libhfstorage_xet.so' apk-contents.txt
+          grep -q 'lib/x86_64/libhfstorage_xet.so' apk-contents.txt
+
       - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: android-build-diagnostics
-          path: android-build.log
-          if-no-files-found: error
+          name: android-xet-build-diagnostics
+          path: |
+            xet-build.log
+            android-build.log
+            apk-contents.txt
+            android/xet-native/Cargo.lock
+          if-no-files-found: warn
           retention-days: 7
-
-      - name: Build installable APK
-        run: gradle -p android :app:assembleDebug --stacktrace
 
       - name: Prepare release asset
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.0.apk
-          sha256sum dist/HFStorage-Android-v0.1.0.apk > dist/HFStorage-Android-v0.1.0.apk.sha256
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.1.apk
+          sha256sum dist/HFStorage-Android-v0.1.1.apk > dist/HFStorage-Android-v0.1.1.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HFStorage-Android-v0.1.0
+          name: HFStorage-Android-v0.1.1
           path: |
-            dist/HFStorage-Android-v0.1.0.apk
-            dist/HFStorage-Android-v0.1.0.apk.sha256
+            dist/HFStorage-Android-v0.1.1.apk
+            dist/HFStorage-Android-v0.1.1.apk.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish Android v0.1.0 release
-        if: (github.event_name == 'pull_request' && github.head_ref == 'feature/android-app-v0.1.0') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
+      - name: Publish Android v0.1.1 release
+        if: (github.event_name == 'pull_request' && github.head_ref == 'fix/android-upload-xet-v0.1.1') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: android-v0.1.0
+          RELEASE_TAG: android-v0.1.1
           RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           cat > android-release-notes.md <<'NOTES'
-          ## HF Storage Android v0.1.0
+          ## HF Storage Android v0.1.1
 
-          İlk yerel Android sürümü.
+          Mobil yükleme çökmesi ve Xet zorunluluğu düzeltme sürümü.
 
-          ### Özellikler
-          - Material 3 ile telefonlara özel modern koyu arayüz
-          - Android Keystore AES-GCM ile şifreli token saklama
-          - Model, Dataset ve Space depolarını listeleme
-          - Depo dosyalarını görüntüleme ve indirme
-          - Dosya ve klasör seçerek arka planda yükleme
-          - 100 dosyaya kadar tek Hugging Face commit'i kullanan batch upload
-          - HTTP LFS basic ve multipart büyük dosya aktarımı
-          - Commit ile silme ve isteğe bağlı geri alınamaz LFS/Xet geçmiş temizliği
-          - WorkManager bildirimleriyle aktarım ilerlemesi
-          - Telemetrisiz, aracı sunucusuz doğrudan huggingface.co bağlantısı
+          ### Düzeltilenler
+          - Android 14, 15 ve 16 için WorkManager `dataSync` foreground service türü eksiksiz tanımlandı.
+          - Yükleme kuyruğuna ekleme ve worker başlatma hataları artık uygulamayı kapatmak yerine arayüzde gösteriliyor.
+          - Bütün worker akışı yakalanan hata ve sansürlenmiş tanı günlüğüyle güvenli biçimde sonlanıyor.
+          - Büyük dosyayı tek seferde belleğe alma yolu kaldırıldı; dosyalar descriptor veya geçici seekable dosya üzerinden akış halinde okunuyor.
 
-          APK GitHub Actions tarafından test edilip derlenmiştir. Bu ilk sürüm debug anahtarıyla imzalanmış, doğrudan kurulabilir bir beta APK'dır.
+          ### Zorunlu Xet
+          - Resmî `hf-xet` Rust çekirdeği Android için arm64-v8a ve x86_64 olarak APK içine gömüldü.
+          - Sıfır bayt dışındaki bütün seçili dosyalar önce Xet ile parçalanır, deduplikasyon uygulanır ve CAS'a gönderilir.
+          - Git LFS basic/multipart yükleme fallback'i tamamen kaldırıldı.
+          - Native Xet yüklenemiyorsa uygulama sessizce başka yönteme geçmez; işlemi açık hata mesajıyla durdurur.
+          - En fazla 100 dosya yine tek Hugging Face commit'i olarak gönderilir.
+
+          APK GitHub Actions tarafından test edilmiş, iki native mimaride Xet kütüphanesinin pakette bulunduğu doğrulanmış ve debug anahtarıyla imzalanmıştır.
           NOTES
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.0.apk dist/HFStorage-Android-v0.1.0.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.1.apk dist/HFStorage-Android-v0.1.1.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.0.apk dist/HFStorage-Android-v0.1.0.apk.sha256 \
+            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.1.apk dist/HFStorage-Android-v0.1.1.apk.sha256 \
               --target "$RELEASE_TARGET" \
-              --title "HF Storage Android v0.1.0" \
+              --title "HF Storage Android v0.1.1" \
               --notes-file android-release-notes.md \
               --repo "$GITHUB_REPOSITORY"
           fi

@@ -17,6 +17,7 @@ import com.apexlions.hfstorage.mobile.data.Repository
 import com.apexlions.hfstorage.mobile.data.TokenStore
 import com.apexlions.hfstorage.mobile.data.UploadJob
 import com.apexlions.hfstorage.mobile.data.UploadQueue
+import com.apexlions.hfstorage.mobile.data.XetNative
 import com.apexlions.hfstorage.mobile.worker.UploadWorker
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -153,14 +154,34 @@ class HfStorageViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun enqueueUpload(job: UploadJob) {
-        UploadQueue(getApplication()).save(job)
-        val request = OneTimeWorkRequestBuilder<UploadWorker>()
-            .setInputData(Data.Builder().putString(UploadWorker.KEY_JOB_ID, job.id).build())
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .addTag(UPLOAD_TAG)
-            .build()
-        workManager.enqueue(request)
-        _state.update { it.copy(message = "${job.items.size} dosyalık yükleme kuyruğa eklendi") }
+        if (!XetNative.isAvailable) {
+            _state.update {
+                it.copy(
+                    error = "Xet zorunlu fakat native bileşen yüklenemedi: ${XetNative.loadError ?: "bilinmeyen hata"}",
+                    message = "",
+                )
+            }
+            return
+        }
+
+        runCatching {
+            UploadQueue(getApplication()).save(job)
+            val request = OneTimeWorkRequestBuilder<UploadWorker>()
+                .setInputData(Data.Builder().putString(UploadWorker.KEY_JOB_ID, job.id).build())
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .addTag(UPLOAD_TAG)
+                .build()
+            workManager.enqueue(request)
+        }.onSuccess {
+            _state.update { it.copy(error = null, message = "${job.items.size} dosyalık Xet yüklemesi kuyruğa eklendi") }
+        }.onFailure { error ->
+            _state.update {
+                it.copy(
+                    error = "Yükleme kuyruğa eklenemedi: ${error.message ?: error::class.java.simpleName}",
+                    message = "",
+                )
+            }
+        }
     }
 
     fun setCapacityTb(value: Double) {
