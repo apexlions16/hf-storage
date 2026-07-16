@@ -71,6 +71,16 @@ jobs:
           test -s android/app/src/main/jniLibs/x86_64/libhfstorage_xet.so
           find android/app/src/main/jniLibs -type f -name '*.so' -print -exec file {} \;
 
+      - name: Package Android rustls verifier bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf android/app/libs
+          python android/scripts/prepare_rustls_platform_verifier.py
+          test -s android/app/libs/rustls-platform-verifier.jar
+          unzip -l android/app/libs/rustls-platform-verifier.jar | tee rustls-bridge-contents.txt
+          grep -q 'org/rustls/platformverifier/.*\.class' rustls-bridge-contents.txt
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -88,13 +98,20 @@ jobs:
           set -o pipefail
           gradle -p android :app:assembleDebug --stacktrace 2>&1 | tee -a android-build.log
 
-      - name: Verify Xet is packaged in APK
+      - name: Verify Xet and Android verifier are packaged
         shell: bash
         run: |
           set -euxo pipefail
-          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | tee apk-contents.txt
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$APK" | tee apk-contents.txt
           grep -q 'lib/arm64-v8a/libhfstorage_xet.so' apk-contents.txt
           grep -q 'lib/x86_64/libhfstorage_xet.so' apk-contents.txt
+          : > dex-strings.txt
+          while IFS= read -r dex; do
+            unzip -p "$APK" "$dex" | strings >> dex-strings.txt
+          done < <(unzip -Z1 "$APK" | grep -E '^classes[0-9]*\.dex$')
+          grep -q 'org/rustls/platformverifier' dex-strings.txt
+          grep -q 'nativeInitialize' dex-strings.txt
 
       - name: Upload build diagnostics
         if: failure()
@@ -105,6 +122,9 @@ jobs:
             xet-build.log
             android-build.log
             apk-contents.txt
+            dex-strings.txt
+            rustls-bridge-contents.txt
+            android/app/libs/rustls-platform-verifier.jar
             android/xet-native/Cargo.lock
           if-no-files-found: warn
           retention-days: 7
@@ -112,53 +132,52 @@ jobs:
       - name: Prepare release asset
         run: |
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.1.apk
-          sha256sum dist/HFStorage-Android-v0.1.1.apk > dist/HFStorage-Android-v0.1.1.apk.sha256
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/HFStorage-Android-v0.1.2.apk
+          sha256sum dist/HFStorage-Android-v0.1.2.apk > dist/HFStorage-Android-v0.1.2.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HFStorage-Android-v0.1.1
+          name: HFStorage-Android-v0.1.2
           path: |
-            dist/HFStorage-Android-v0.1.1.apk
-            dist/HFStorage-Android-v0.1.1.apk.sha256
+            dist/HFStorage-Android-v0.1.2.apk
+            dist/HFStorage-Android-v0.1.2.apk.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish Android v0.1.1 release
-        if: (github.event_name == 'pull_request' && github.head_ref == 'fix/android-upload-xet-v0.1.1') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
+      - name: Publish Android v0.1.2 release
+        if: (github.event_name == 'pull_request' && github.head_ref == 'fix/android-rustls-log-access-v0.1.2') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release(android):'))
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: android-v0.1.1
+          RELEASE_TAG: android-v0.1.2
           RELEASE_TARGET: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           cat > android-release-notes.md <<'NOTES'
-          ## HF Storage Android v0.1.1
+          ## HF Storage Android v0.1.2
 
-          Mobil yükleme çökmesi ve Xet zorunluluğu düzeltme sürümü.
+          Android Xet TLS doğrulama ve tanı günlüğü erişimi düzeltme sürümü.
 
-          ### Düzeltilenler
-          - Android 14, 15 ve 16 için WorkManager `dataSync` foreground service türü eksiksiz tanımlandı.
-          - Yükleme kuyruğuna ekleme ve worker başlatma hataları artık uygulamayı kapatmak yerine arayüzde gösteriliyor.
-          - Bütün worker akışı yakalanan hata ve sansürlenmiş tanı günlüğüyle güvenli biçimde sonlanıyor.
-          - Büyük dosyayı tek seferde belleğe alma yolu kaldırıldı; dosyalar descriptor veya geçici seekable dosya üzerinden akış halinde okunuyor.
+          ### Xet / TLS düzeltmesi
+          - `rustls-platform-verifier` uygulama başlarken Android Context, JVM ve class loader ile başlatılır.
+          - Resmî Android TrustManager köprüsü Cargo'daki sürümle eşleştirilerek APK içine eklenir.
+          - Xet write-token isteğinde görülen `Expect rustls-platform-verifier to be initialized` paniği giderildi.
+          - APK doğrulaması hem iki native Xet kütüphanesini hem Android verifier sınıflarını kontrol eder.
 
-          ### Zorunlu Xet
-          - Resmî `hf-xet` Rust çekirdeği Android için arm64-v8a ve x86_64 olarak APK içine gömüldü.
-          - Sıfır bayt dışındaki bütün seçili dosyalar önce Xet ile parçalanır, deduplikasyon uygulanır ve CAS'a gönderilir.
-          - Git LFS basic/multipart yükleme fallback'i tamamen kaldırıldı.
-          - Native Xet yüklenemiyorsa uygulama sessizce başka yönteme geçmez; işlemi açık hata mesajıyla durdurur.
-          - En fazla 100 dosya yine tek Hugging Face commit'i olarak gönderilir.
+          ### Tanı günlükleri
+          - Tokenı sansürlenmiş hata günlüğü korunur.
+          - Her yükleme hatasında okunabilir bir kopya `İndirilenler/HFStorage` klasörüne aktarılır.
+          - FileProvider altyapısıyla günlük güvenli `content://` URI üzerinden paylaşılabilir.
+          - Uygulama artık kullanıcıya erişemeyeceği yalnızca `/data/user/0/...` yolunu göstermiyor.
 
-          APK GitHub Actions tarafından test edilmiş, iki native mimaride Xet kütüphanesinin pakette bulunduğu doğrulanmış ve debug anahtarıyla imzalanmıştır.
+          APK GitHub Actions tarafından test edilmiş ve debug anahtarıyla imzalanmıştır.
           NOTES
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.1.apk dist/HFStorage-Android-v0.1.1.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_TAG" dist/HFStorage-Android-v0.1.2.apk dist/HFStorage-Android-v0.1.2.apk.sha256 --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.1.apk dist/HFStorage-Android-v0.1.1.apk.sha256 \
+            gh release create "$RELEASE_TAG" dist/HFStorage-Android-v0.1.2.apk dist/HFStorage-Android-v0.1.2.apk.sha256 \
               --target "$RELEASE_TARGET" \
-              --title "HF Storage Android v0.1.1" \
+              --title "HF Storage Android v0.1.2" \
               --notes-file android-release-notes.md \
               --repo "$GITHUB_REPOSITORY"
           fi
