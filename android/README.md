@@ -53,6 +53,22 @@ Bu nedenle v0.1.3 ve sonrasında her boş olmayan belge Xet'e verilmeden önce u
 
 Hub `preupload` yanıtı son Git commit girdisinin normal blob mu yoksa `lfsFile` pointer mı olacağını belirlemeye devam eder. Ağ aktarımı ve deduplikasyon zorunlu Xet çekirdeği tarafından yapılır; Git LFS HTTP upload fallback'i yoktur.
 
+## Hub commit koruması
+
+v0.1.4 ile bütün `/commit/` istekleri ağ katmanında gönderilmeden önce doğrulanır ve resmî `huggingface_hub` NDJSON biçimine getirilir.
+
+İlk kayıt her zaman şu yapıyı taşır:
+
+```json
+{"key":"header","value":{"summary":"Batch upload with HF Storage Android","description":""}}
+```
+
+- `summary` eksik veya boşsa güvenli varsayılan değer eklenir.
+- Header eksikse ilk kayıt olarak eklenir.
+- UTF-8 BOM temizlenir.
+- İstek kesin UTF-8 baytlarıyla ve `application/x-ndjson` içerik türüyle gönderilir.
+- Dosya operasyon satırları yeniden Base64 çözülmez; yalnızca header kanonikleştirilir.
+
 ## Yerel derleme
 
 Gereksinimler:
