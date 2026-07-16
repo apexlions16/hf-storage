@@ -5,6 +5,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+val rustlsVerifierJar = file("libs/rustls-platform-verifier.jar")
+
 android {
     namespace = "com.apexlions.hfstorage.mobile"
     compileSdk = 35
@@ -13,8 +15,8 @@ android {
         applicationId = "com.apexlions.hfstorage.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -81,9 +83,27 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // rustls-platform-verifier uses a small Kotlin/JVM bridge on Android to
+    // access the system TrustManager. The preparation script copies the exact
+    // classes.jar matching Cargo's Rust dependency into app/libs.
+    implementation(files(rustlsVerifierJar))
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+}
+
+val verifyRustlsVerifierJar by tasks.registering {
+    doLast {
+        check(rustlsVerifierJar.isFile && rustlsVerifierJar.length() > 0L) {
+            "rustls-platform-verifier Android bridge is missing. Run: " +
+                "python android/scripts/prepare_rustls_platform_verifier.py"
+        }
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(verifyRustlsVerifierJar)
 }
