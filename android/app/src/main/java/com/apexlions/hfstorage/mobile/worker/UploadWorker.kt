@@ -74,14 +74,18 @@ class UploadWorker(
             throw cancelled
         } catch (error: Throwable) {
             Log.e(TAG, "Upload failed for job=$id", error)
-            val log = UploadDiagnostics.write(applicationContext, job, token, error)
+            val diagnostic = UploadDiagnostics.write(applicationContext, job, token, error)
             val message = buildString {
                 append(error.message ?: error::class.java.simpleName)
-                if (log != null) {
-                    append("\nTanı günlüğünü Aktarımlar ekranındaki paylaş düğmesiyle dışa aktarabilirsiniz.")
+                diagnostic?.exportedLocation?.let { location ->
+                    append("\nTanı günlüğü: $location")
+                } ?: run {
+                    if (diagnostic != null) {
+                        append("\nTanı günlüğünü uygulama içinden paylaşabilirsiniz.")
+                    }
                 }
             }
-            Result.failure(errorData(message, log?.absolutePath))
+            Result.failure(errorData(message, diagnostic?.privateFile?.absolutePath))
         }
     }
 
